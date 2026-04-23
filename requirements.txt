@@ -1,0 +1,9 @@
+django
+djangorestframework
+fastapi
+uvicorn
+pydantic
+python-dotenv
+sqlalchemy
+langchain-groq
+resend
