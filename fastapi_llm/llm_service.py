@@ -3,6 +3,7 @@ import re
 import json
 import threading
 import asyncio
+import urllib.request
 from datetime import datetime, date
 from decimal import Decimal
 
@@ -153,8 +154,14 @@ If a user mentions a guest by a partial name and you suspect multiple matches, g
 FORBIDDEN: Do NOT generate an UPDATE, DELETE, or INSERT query for an ambiguous name without first verifying it's a unique match.
 
 UPDATE RSVP status:
-  UPDATE events_rsvp SET status = '<new_status>'
-  WHERE guest_id = (SELECT id FROM events_guest WHERE name = '<FULL_UNIQUE_NAME>');
+  DO NOT use raw SQL UPDATE. Instead, return a JSON object exactly like this:
+  {{"action": "update_guest_rsvp", "guest_id": 1, "event_name": "Wedding", "status": "attending"}}
+  Make sure you already know the exact guest_id from a previous SELECT query. If you do not know the guest_id, run a SELECT query first to find it.
+
+ADD plus ones:
+  DO NOT use raw SQL UPDATE. Instead, return a JSON object exactly like this:
+  {{"action": "add_plus_one", "guest_id": 1, "event_name": "Wedding", "count": 1}}
+  Again, you must know the exact guest_id first.
 
 If the name is not unique or only a first name is provided:
   SELECT id, name, email FROM events_guest WHERE name LIKE '%<partial_name>%';
@@ -182,8 +189,11 @@ Only proceed with the UPDATE if you are certain of the identity.
     response = llm.invoke(prompt)
     raw_sql = clean_sql(response.content)
 
-    upper = raw_sql.upper().strip()
-    intent = "write" if any(upper.startswith(w) for w in ["INSERT", "UPDATE", "REPLACE"]) else "read"
+    if raw_sql.startswith("{") and raw_sql.endswith("}"):
+        intent = "api_action"
+    else:
+        upper = raw_sql.upper().strip()
+        intent = "write" if any(upper.startswith(w) for w in ["INSERT", "UPDATE", "REPLACE"]) else "read"
 
     return raw_sql, intent
 
@@ -194,6 +204,8 @@ def stream_natural_answer(question: str, sql: str, data: list, intent: str, hist
 
     if intent == "write":
         result_context = f"The database operation completed successfully. {rows_affected} rows were affected."
+    elif intent == "api_action":
+        result_context = f"The API action completed with the following response:\n{data_str}"
     else:
         result_context = f"The database returned {len(data)} records:\n{data_str}"
 
@@ -284,29 +296,55 @@ def process_and_stream(session_id: str, user_message: str):
     try:
         sql_query, intent = generate_sql_from_question(user_message, history_text)
 
-        if not is_safe_sql(sql_query):
-            error_msg = "I'm sorry, I cannot perform that operation as it could damage the database."
-            sessions[session_id].append({"role": "user", "content": user_message})
-            sessions[session_id].append({"role": "assistant", "content": error_msg})
-            yield error_msg
-            return
-
         data_result = []
         rows_affected = 0
-        with sql_engine.connect() as conn:
-            result = conn.execute(text(sql_query))
 
-            if intent == "write":
-                conn.commit()
-                rows_affected = result.rowcount
-                if "messaging_messagelog" in sql_query.lower() and sql_query.upper().strip().startswith("INSERT"):
-                    _trigger_actual_emails(conn, rows_affected)
-            else:
-                columns = result.keys()
-                raw_rows = result.fetchall()
-                for row in raw_rows:
-                    safe_row = {k: make_json_safe(v) for k, v in zip(columns, row)}
-                    data_result.append(safe_row)
+        if intent == "api_action":
+            try:
+                payload = json.loads(sql_query)
+                action = payload.get("action")
+                
+                url_map = {
+                    "update_guest_rsvp": "http://127.0.0.1:8000/api/events/rsvp/update/",
+                    "add_plus_one": "http://127.0.0.1:8000/api/events/rsvp/plus-one/"
+                }
+                
+                if action in url_map:
+                    req = urllib.request.Request(
+                        url_map[action],
+                        data=json.dumps(payload).encode('utf-8'),
+                        headers={'Content-Type': 'application/json'}
+                    )
+                    with urllib.request.urlopen(req) as response:
+                        response_data = json.loads(response.read().decode())
+                        data_result.append(response_data)
+                else:
+                    data_result.append({"error": f"Unknown action: {action}"})
+            except Exception as e:
+                data_result.append({"error": str(e)})
+                
+        else:
+            if not is_safe_sql(sql_query):
+                error_msg = "I'm sorry, I cannot perform that operation as it could damage the database."
+                sessions[session_id].append({"role": "user", "content": user_message})
+                sessions[session_id].append({"role": "assistant", "content": error_msg})
+                yield error_msg
+                return
+
+            with sql_engine.connect() as conn:
+                result = conn.execute(text(sql_query))
+
+                if intent == "write":
+                    conn.commit()
+                    rows_affected = result.rowcount
+                    if "messaging_messagelog" in sql_query.lower() and sql_query.upper().strip().startswith("INSERT"):
+                        _trigger_actual_emails(conn, rows_affected)
+                else:
+                    columns = result.keys()
+                    raw_rows = result.fetchall()
+                    for row in raw_rows:
+                        safe_row = {k: make_json_safe(v) for k, v in zip(columns, row)}
+                        data_result.append(safe_row)
 
         full_response = ""
         for chunk in stream_natural_answer(user_message, sql_query, data_result, intent, history_text, rows_affected):
