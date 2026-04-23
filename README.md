@@ -39,7 +39,6 @@ pip install -r requirements.txt
 # Setup Django Database
 cd django_backend
 python manage.py migrate
-python manage.py seed_data.py  # Seed initial events and guests
 ```
 
 ### 4. Frontend Setup
