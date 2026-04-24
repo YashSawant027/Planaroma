@@ -142,13 +142,11 @@ Recent conversation:
 User's question: "{question}"
 
 Your task:
-1. If the question requires database data, write a single SQLite-compatible SQL query to answer it.
-2. If the user asks about the chat history, or asks a general conversational question, you may respond directly in natural language instead of writing SQL.
-   *NOTE: If the user asks "what was my last question", they mean the last User message in the 'Recent conversation', not the current question itself.*
-3. For questions about "all people", "all guests", "everyone" → SELECT from events_guest.
-4. For listing who is attending/pending/declined → JOIN events_rsvp with events_guest and events_event.
-5. NEVER use DROP, DELETE, ALTER, TRUNCATE.
-6. If querying the database, return ONLY the raw SQL. No markdown. If responding directly, return your natural language text.
+1. Write a single SQLite-compatible SQL query to answer the question.
+2. For questions about "all people", "all guests", "everyone" → SELECT from events_guest.
+3. For listing who is attending/pending/declined → JOIN events_rsvp with events_guest and events_event.
+4. NEVER use DROP, DELETE, ALTER, TRUNCATE.
+5. Return ONLY the raw SQL. No markdown, no explanation.
 
 CRITICAL RULES FOR WRITE OPERATIONS:
 
@@ -170,16 +168,24 @@ If the name is not unique or only a first name is provided:
 
 INSERT emails to ALL guests (no event filter):
   INSERT INTO messaging_messagelog (guest_id, event_id, provider_message_id, status, subject, body, created_at, updated_at)
-  SELECT g.id, NULL, hex(randomblob(16)), 'sent', '<subject>', 'Hi ' || g.name || ', <body>', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+  SELECT g.id, NULL, hex(randomblob(16)), 'sent', 'Planorama Update', 'Hi ' || g.name || ', We have an important update regarding the wedding. Please stay tuned!', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
   FROM events_guest g;
 
 INSERT emails to guests of a specific event:
   INSERT INTO messaging_messagelog (guest_id, event_id, provider_message_id, status, subject, body, created_at, updated_at)
-  SELECT g.id, r.event_id, hex(randomblob(16)), 'sent', '<subject>', 'Hi ' || g.name || ', <body>', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+  SELECT g.id, r.event_id, hex(randomblob(16)), 'sent', 'Planorama Update', 'Hi ' || g.name || ', We have an important update regarding the wedding. Please stay tuned!', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
   FROM events_guest g
   JOIN events_rsvp r ON r.guest_id = g.id
   JOIN events_event e ON e.id = r.event_id
   WHERE e.name LIKE '%<event_name>%';
+
+INSERT email to a specific guest:
+  INSERT INTO messaging_messagelog (guest_id, event_id, provider_message_id, status, subject, body, created_at, updated_at)
+  SELECT id, NULL, hex(randomblob(16)), 'sent', 'Planorama Update', 'Hi ' || name || ', We have an important update regarding the wedding. Please stay tuned!', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+  FROM events_guest
+  WHERE name LIKE '%<guest_name>%';
+
+CRITICAL: If the user asks to send an email, DO NOT ask them for a subject or body. ALWAYS generate the INSERT query immediately using the default subject and body shown above.
 
 NEVER use a static string like 'provider_xyz' for provider_message_id. ALWAYS use hex(randomblob(16)).
 
@@ -196,12 +202,7 @@ Only proceed with the UPDATE if you are certain of the identity.
         intent = "api_action"
     else:
         upper = raw_sql.upper().strip()
-        if any(upper.startswith(w) for w in ["INSERT", "UPDATE", "REPLACE", "DELETE"]):
-            intent = "write"
-        elif any(upper.startswith(w) for w in ["SELECT", "WITH", "PRAGMA"]):
-            intent = "read"
-        else:
-            intent = "direct_response"
+        intent = "write" if any(upper.startswith(w) for w in ["INSERT", "UPDATE", "REPLACE"]) else "read"
 
     return raw_sql, intent
 
@@ -299,16 +300,29 @@ def process_and_stream(session_id: str, user_message: str):
         sessions[session_id] = []
 
     history = sessions[session_id]
+    
+    user_msg_lower = re.sub(r'[^a-z\s]', '', user_message.lower().strip())
+    if "what was my last question" in user_msg_lower or "what was my previous question" in user_msg_lower:
+        last_question = None
+        for msg in reversed(history):
+            if msg["role"] == "user":
+                last_question = msg["content"]
+                break
+        
+        if last_question:
+            response = f"Your last question was: \"{last_question}\""
+        else:
+            response = "You haven't asked any questions yet in this session."
+            
+        sessions[session_id].append({"role": "user", "content": user_message})
+        sessions[session_id].append({"role": "assistant", "content": response})
+        yield response
+        return
+
     history_text = format_history_for_prompt(history)
 
     try:
         sql_query, intent = generate_sql_from_question(user_message, history_text)
-
-        if intent == "direct_response":
-            sessions[session_id].append({"role": "user", "content": user_message})
-            sessions[session_id].append({"role": "assistant", "content": sql_query})
-            yield sql_query
-            return
 
         data_result = []
         rows_affected = 0
