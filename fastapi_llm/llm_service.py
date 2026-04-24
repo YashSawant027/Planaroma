@@ -142,11 +142,13 @@ Recent conversation:
 User's question: "{question}"
 
 Your task:
-1. Write a single SQLite-compatible SQL query to answer the question.
-2. For questions about "all people", "all guests", "everyone" → SELECT from events_guest.
-3. For listing who is attending/pending/declined → JOIN events_rsvp with events_guest and events_event.
-4. NEVER use DROP, DELETE, ALTER, TRUNCATE.
-5. Return ONLY the raw SQL. No markdown, no explanation.
+1. If the question requires database data, write a single SQLite-compatible SQL query to answer it.
+2. If the user asks about the chat history, or asks a general conversational question, you may respond directly in natural language instead of writing SQL.
+   *NOTE: If the user asks "what was my last question", they mean the last User message in the 'Recent conversation', not the current question itself.*
+3. For questions about "all people", "all guests", "everyone" → SELECT from events_guest.
+4. For listing who is attending/pending/declined → JOIN events_rsvp with events_guest and events_event.
+5. NEVER use DROP, DELETE, ALTER, TRUNCATE.
+6. If querying the database, return ONLY the raw SQL. No markdown. If responding directly, return your natural language text.
 
 CRITICAL RULES FOR WRITE OPERATIONS:
 
@@ -184,6 +186,7 @@ NEVER use a static string like 'provider_xyz' for provider_message_id. ALWAYS us
 If the user says "Update Yash's RSVP", do NOT immediately run an UPDATE if there could be multiple. Run a SELECT to check first:
   SELECT id, name, email FROM events_guest WHERE name LIKE '%<guest_name>%';
 Only proceed with the UPDATE if you are certain of the identity.
+
 """
 
     response = llm.invoke(prompt)
@@ -193,7 +196,12 @@ Only proceed with the UPDATE if you are certain of the identity.
         intent = "api_action"
     else:
         upper = raw_sql.upper().strip()
-        intent = "write" if any(upper.startswith(w) for w in ["INSERT", "UPDATE", "REPLACE"]) else "read"
+        if any(upper.startswith(w) for w in ["INSERT", "UPDATE", "REPLACE", "DELETE"]):
+            intent = "write"
+        elif any(upper.startswith(w) for w in ["SELECT", "WITH", "PRAGMA"]):
+            intent = "read"
+        else:
+            intent = "direct_response"
 
     return raw_sql, intent
 
@@ -295,6 +303,12 @@ def process_and_stream(session_id: str, user_message: str):
 
     try:
         sql_query, intent = generate_sql_from_question(user_message, history_text)
+
+        if intent == "direct_response":
+            sessions[session_id].append({"role": "user", "content": user_message})
+            sessions[session_id].append({"role": "assistant", "content": sql_query})
+            yield sql_query
+            return
 
         data_result = []
         rows_affected = 0
